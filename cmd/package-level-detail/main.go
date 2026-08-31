@@ -165,6 +165,14 @@ var csvHeader = []string{
 	"shipping charge",
 }
 
+// csvColCarrier and csvColShipDate index into a boxRow-produced row (and
+// must be kept in sync with csvHeader/boxRow's column order) - used to sort
+// the output by carrier, then ship date, before writing the CSV.
+const (
+	csvColCarrier  = 2
+	csvColShipDate = 4
+)
+
 // formatFloat renders a float the way spreadsheet software expects: no
 // trailing zeros, but also no scientific notation for ordinary package
 // weights/dimensions/costs.
@@ -402,6 +410,18 @@ func main() {
 			tallyBox(tallies, carrier, box)
 		}
 	}
+
+	// Sort the CSV by carrier, then by ship date within each carrier.
+	// Ship date is already "YYYY-MM-DD", so a plain string comparison
+	// sorts it chronologically without needing to re-parse it. Stable so
+	// rows that tie on both keys (e.g. multiple boxes on one order) keep
+	// the order they were built in.
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i][csvColCarrier] != rows[j][csvColCarrier] {
+			return rows[i][csvColCarrier] < rows[j][csvColCarrier]
+		}
+		return rows[i][csvColShipDate] < rows[j][csvColShipDate]
+	})
 
 	csvPath := filepath.Join(outDir, fmt.Sprintf("package_level_detail_%s_to_%s.csv", start.Format("2006-01-02"), end.Format("2006-01-02")))
 	f, err := os.Create(csvPath)

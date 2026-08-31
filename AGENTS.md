@@ -21,8 +21,9 @@ built on Goflow order data:
      step 2, asks that carrier's API whether the package has actually been
      physically scanned yet (not just labeled/manifested).
   6. Writes a CSV (`order id, date shipped, carrier, shipping method,
-     tracking number, carrier scanned`) and a plain-text log file mirroring
-     the console output.
+     tracking number, carrier scanned`), an Excel (`.xlsx`) copy of the same
+     report converted from that CSV, and a plain-text log file mirroring the
+     console output.
   7. Prints a timing breakdown at the end.
 - **`package-level-detail`** (`cmd/package-level-detail`): prompts for (or
   takes as an argument) a date range and writes a CSV with one row per
@@ -31,11 +32,15 @@ built on Goflow order data:
   ZIP/state, and shipping charge. No carrier API calls, no log file - just
   a Goflow pull and a CSV write.
 
-Both commands are `cmd/` binaries sharing one `internal/` package: the
-Goflow API client (`internal/goflow`) is factored out so any command
-binary in this module can import it - see "File layout" below - while
-everything CLI-specific to each command (config/env loading, its own date
-range handling, output format) stays in that command's own `main.go`.
+Both commands are `cmd/` binaries sharing several `internal/` packages: the
+Goflow API client (`internal/goflow`), the `.env` loader (`internal/env`),
+one package per carrier under `internal/carriers` (`internal/carriers/ups`,
+`/fedex`, `/usps`, `/amazon`, each a self-contained client for that
+carrier's tracking API) - used only by `cmd/tracker` today, but reusable by
+any future command - and a stdlib-only CSV-to-Excel converter
+(`internal/xlsx`, used only by `cmd/tracker` today). See "File layout"
+below. Everything CLI-specific to each command (config/env loading, its own
+date range handling, output format) stays in that command's own `main.go`.
 
 ## Build & run
 
@@ -75,9 +80,24 @@ list.
 
 - `cmd/tracker/main.go` - the CLI program: `env.Load()` + its own `config`/
   `loadConfig`, the interactive welcome/carrier-selection menu, the date
-  prompt, carrier tracking lookups (`scanChecker` + one implementation per
-  carrier), the per-carrier rate limiter, progress bars, the log file, and
-  `main()` itself.
+  prompt, the `scanChecker` interface and `detectCarrierFromTrackingNumber`
+  (cross-carrier orchestration - which carrier's package to call, and the
+  amazon_shipping fallback), the per-carrier rate limiter, progress bars,
+  the log file, and `main()` itself. Each carrier's actual API
+  implementation lives in its own `internal/carriers/<carrier>` package
+  (see below), not here.
+- `internal/carriers/ups/ups.go`, `internal/carriers/fedex/fedex.go`,
+  `internal/carriers/usps/usps.go`, `internal/carriers/amazon/amazon.go` -
+  one self-contained client package per carrier, each exposing a `Checker`
+  type (`New(...)` constructor, `Ping(ctx) error`, `Scanned(ctx,
+  trackingNumber) (bool, error)`) plus - for ups/fedex/usps, the three
+  carriers `detectCarrierFromTrackingNumber` can fall back to -
+  `LooksLikeTrackingNumber(trackingNumber string) bool`. None of these
+  packages import `cmd/tracker` or each other; `cmd/tracker`'s `scanChecker`
+  interface is satisfied structurally (Go doesn't require a package to
+  import an interface to implement it), so there's no import cycle and each
+  carrier package could be reused by a future command without pulling in
+  the CLI. See SKILLS.md for the step-by-step pattern to add a new one.
 - `internal/goflow/goflow.go` - the Goflow API client (`Client`, `Order`/
   `Shipment`/`Box`/`Weight`/`Dimensions`/`Cost`/`ShippingAddress`,
   `FetchShippedOrders`), factored out so any command in this module can
@@ -96,15 +116,28 @@ list.
   identical `.env`-search-then-apply behavior, and unlike the Goflow client
   this one has no CLI-specific parts to keep separate, so it's just a single
   `Load()` call with nothing to configure.
+- `internal/xlsx/xlsx.go` - a minimal, stdlib-only .xlsx (Office Open XML
+  SpreadsheetML) writer: `WriteFile`/`Write` take a `[][]string` grid and
+  produce a single unstyled sheet (every cell as inline-string plain text,
+  no number/date formatting); `ConvertFile` reads a CSV file and writes the
+  equivalent `.xlsx`. Written by hand rather than adding a third-party
+  Excel library, to keep this module's "no dependencies" rule intact even
+  though network access to fetch one is actually available in this
+  environment (see "Design decisions" below) - deliberately narrow in
+  scope (this module's reports are always a flat single-sheet grid; it
+  doesn't need to be a general-purpose Excel library).
 - `cmd/package-level-detail/main.go` - the package-level-detail CLI:
   `env.Load()` + its own minimal `config` (just the two Goflow vars - it
   doesn't need carrier credentials at all), its own date-range parsing
   (`parseDateRange`/`promptDateRange`, accepting the range as a CLI argument
   or falling back to an interactive prompt), a `goflow.Client` pull, and a
   CSV write (`boxRow` builds one row per box - `csvHeader` fixes the column
-  order). Note the directory was originally created as `packag-level-detail`
-  (missing an "e") and has since been renamed to match this section's
-  heading.
+  order; `csvColCarrier`/`csvColShipDate` index into a `boxRow` result and
+  must stay in sync with it - used to `sort.SliceStable` the rows by
+  carrier then ship date, same ordering and reasoning as `cmd/tracker`'s
+  own sort, before writing). Note the directory was originally created as
+  `packag-level-detail` (missing an "e") and has since been renamed to
+  match this section's heading.
 - `go.mod` - module `internal-shipment-tracker`, Go 1.21, no dependencies.
 - `.env.example` - copy to `.env` and fill in.
 - `README.md` - user-facing docs (setup, flags, run instructions, notes and
@@ -125,6 +158,32 @@ list.
   `os.Environ()`; each command still has its own `config`/`loadConfig` that
   calls `os.Getenv` afterward for the specific variables it cares about.
 
+### `internal/xlsx/xlsx.go`
+
+- `WriteFile(path string, rows [][]string) error` / `Write(w io.Writer,
+  rows [][]string) error` build a `.xlsx` from scratch: five fixed XML
+  parts zipped together (`[Content_Types].xml`, `_rels/.rels`,
+  `xl/workbook.xml`, `xl/_rels/workbook.xml.rels`) plus one generated part,
+  `xl/worksheets/sheet1.xml` (built by the private `sheetXML`) - one `<row>`
+  per slice, one `<c t="inlineStr">` cell per string, `columnName` doing the
+  0-based-index-to-spreadsheet-letters conversion (0→A, 25→Z, 26→AA, ...).
+  Inline strings were chosen specifically to avoid needing a shared-strings
+  table, which is the main source of complexity in a "real" `.xlsx` writer.
+- `escapeCellText` strips control characters genuinely illegal in XML 1.0
+  (`encoding/xml.EscapeText` alone doesn't filter these - it only escapes
+  `& < > ' "` and encodes tab/CR/LF as numeric references) before handing
+  off to `xml.EscapeText`, so a stray control byte in the data can't produce
+  a corrupt file.
+- `ConvertFile(csvPath, xlsxPath string) error` reads a CSV with
+  `encoding/csv` and passes the resulting rows straight to `WriteFile` -
+  this is what `cmd/tracker` calls right after writing its CSV.
+- Deliberately narrow: one unstyled sheet, every cell as plain text (no
+  number/date typing, no formatting/column widths). Verified by hand
+  (`go test` isn't part of this module's normal workflow) against a real
+  parser - `openpyxl` - during development; if `.xlsx` output ever needs
+  real number formatting/multiple sheets/styling, this package will need
+  real changes, not just more call sites.
+
 ### `internal/goflow/goflow.go`
 
 - `Order`/`Shipment`/`Box` - the subset of Goflow's order/shipment JSON shape
@@ -142,6 +201,38 @@ list.
   right after if another page follows ("More Goflow orders indicated."),
   so a caller watching `Notice` can tell pagination is still in progress
   rather than the pull having stalled.
+
+### `internal/carriers/<carrier>/<carrier>.go` (ups, fedex, usps, amazon)
+
+Each of the four follows the identical shape (copy the closest existing one
+when adding a new carrier - see SKILLS.md):
+
+- A private `token(ctx) (string, error)` method, mutex-guarded, caching the
+  OAuth access token and refreshing ~60s before it actually expires.
+  UPS/FedEx/USPS use a client_credentials grant (`New(clientID,
+  clientSecret string)`); `amazon` uses a refresh_token grant instead
+  (`New(clientID, clientSecret, refreshToken, endpoint string)`) since
+  SP-API access has to be tied to a specific seller's authorization.
+- `Ping(ctx) error` - the same one-liner in all four: call `token(ctx)`,
+  discard the token, return the error. Credential validity just means "can
+  this get an OAuth token."
+- `Scanned(ctx, trackingNumber) (bool, error)` - the actual tracking call
+  and carrier-specific "has this had a physical scan yet" logic (UPS
+  activity `status.type`, FedEx `scanEvents` codes, USPS `statusCategory`,
+  Amazon `eventHistory`/`summary.status`). USPS's also retries on 429 using
+  its own private `retryAfterDelay` (a third copy of the same ~10-line
+  helper also duplicated in `internal/goflow` and, historically, in
+  `cmd/tracker` - see that helper's doc comment for why duplicating it was
+  chosen over a shared dependency).
+- `ups`/`fedex`/`usps` (not `amazon`, which is never the target of the
+  fallback) additionally export `LooksLikeTrackingNumber(trackingNumber
+  string) bool`, backed by a private, deliberately conservative regex - used
+  by `cmd/tracker`'s `detectCarrierFromTrackingNumber` for the
+  amazon_shipping-is-really-a-relabeled-UPS/FedEx/USPS-shipment fallback.
+- None of the four import `cmd/tracker`, `internal/goflow`, or each other.
+  `cmd/tracker`'s `scanChecker` interface doesn't need any of them to import
+  it either - Go interface satisfaction is structural, so a `*ups.Checker`
+  (etc.) satisfies it just by having matching `Ping`/`Scanned` methods.
 
 ### `cmd/tracker/main.go` (top to bottom)
 
@@ -162,21 +253,15 @@ itself; this is the same order:
 3. **Date range prompt** - `promptDateRange`, `dateRangeRe`. Accepts either
    `YYYY-MM-DD to YYYY-MM-DD` or a single `YYYY-MM-DD` (end defaults to
    today, UTC). Also takes the shared `*bufio.Reader`, for the same reason.
-4. **Carrier tracking lookups** - `retryAfterDelay` (a private copy of
-   `internal/goflow`'s helper - USPS's checker needs the same `Retry-After`
-   parsing and there was no reason to make `cmd/tracker` import
-   `internal/goflow` just for a 10-line utility), then the `scanChecker`
-   interface
-   (`Ping(ctx) error`, `Scanned(ctx, trackingNumber) (bool, error)`),
-   `detectCarrierFromTrackingNumber` (regex-based UPS/FedEx/USPS format
-   detection used to bypass Amazon SP-API when possible), then
+4. **Carrier tracking lookups** - the `scanChecker` interface (`Ping(ctx)
+   error`, `Scanned(ctx, trackingNumber) (bool, error)` - satisfied
+   structurally by each `internal/carriers/<carrier>.Checker`, see above),
+   `detectCarrierFromTrackingNumber` (calls each carrier package's
+   `LooksLikeTrackingNumber` to bypass Amazon SP-API when possible), then
    `rateLimiter`/`carrierRateLimit`/`carrierRateLimits`/`rateLimitFor`
-   (per-carrier token-bucket rate limiting, see below), then one
-   struct+constructor+`Ping`+`Scanned` per carrier: `upsChecker`,
-   `fedexChecker`, `uspsChecker`, `amazonShippingChecker`. Every `Ping` is
-   the same one-liner - call `token(ctx)`, discard the token, return the
-   error - since credential validity for all four carriers just means "can
-   this client ID/secret (or refresh token) get an OAuth token."
+   (per-carrier token-bucket rate limiting, see below). The carriers'
+   actual API implementations are *not* here - see the
+   `internal/carriers/<carrier>` section above.
 5. **Console progress bars** - `multiProgress` (ANSI in-place line updates),
    `renderProgressBar`, `renderProgressText`.
 6. **Log file** - `dualWriter` (console + log file fan-out),
@@ -184,7 +269,8 @@ itself; this is the same order:
 7. **main** - `printUsage`, then `main()` itself:
    - Parse flags, handle `-h`/`-help`/`help`, create `-dir`.
    - Call `env.Load()`, then `loadConfig()`; build the `checkers` map (only
-     for carriers with full credentials), fix `knownCarriers` order (`ups`,
+     for carriers with full credentials - `ups.New(...)`, `fedex.New(...)`,
+     `usps.New(...)`, `amazon.New(...)`), fix `knownCarriers` order (`ups`,
      `fedex`, `usps`, `amazon_shipping`).
    - Create one `stdin := bufio.NewReader(os.Stdin)` and pass it to every
      interactive prompt for the rest of the run (welcome menu, carrier
@@ -241,7 +327,15 @@ itself; this is the same order:
      credentials, no API access authorization, ...) rather than an ordinary
      hiccup.
    - **Pass 2**: turn `pending` + lookup results into final CSV rows.
-   - Write the CSV (`shipped_orders_<start>_to_<end>.csv`), timed.
+   - Sort `rows` by carrier, then by `dateShipped` within each carrier
+     (`sort.SliceStable` on plain string comparisons - `dateShipped` is
+     already `YYYY-MM-DD`, so string order is chronological order; stable
+     so same-carrier-same-date rows keep the order Pass 1/2 produced).
+   - Write the CSV (`tracking_report_<start>_to_<end>.csv`), timed.
+   - Convert that same CSV to `tracking_report_<start>_to_<end>.xlsx` via
+     `xlsx.ConvertFile` - best-effort: a conversion failure is logged as a
+     `Warning:` (via `dualWriter`) rather than exiting non-zero, since the
+     CSV (already written and unaffected) is the report of record.
    - Print the timing breakdown (fetch, per-carrier, write, total) to both
      console and the log file.
 
@@ -251,8 +345,11 @@ itself; this is the same order:
   access to fetch Go modules or even install a Go toolchain in the dev
   sandbox, so everything is stdlib. Don't add a dependency without a strong
   reason and calling it out. (It started as a literal single file; it's now
-  `cmd/tracker/main.go` + `internal/goflow/goflow.go` - see "File layout" -
-  but the "no dependencies" part of the original reasoning still applies.)
+  spread across several `cmd/`/`internal/` packages - see "File layout" -
+  but the "no dependencies" part of the original reasoning still applies,
+  and still held even once network access to actually fetch a module
+  *did* become available: `internal/xlsx` is a hand-rolled `.xlsx` writer
+  chosen specifically over adding a third-party Excel library for this.)
 - **Carrier "scanned" logic is best-effort and explicitly flagged as such**
   in a comment right above each `return` in each carrier's `Scanned`
   method - naming the exact status code/field relied on and asking future

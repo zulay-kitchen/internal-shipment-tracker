@@ -2,7 +2,8 @@
 // "Help me" - the latter prints this usage text and asks again), then asks
 // which configured carrier(s) to check (or "All"), then a date range, pulls
 // every order that Goflow marked "shipped" whose shipment.shipped_at falls
-// in that range, and writes a CSV with one row per tracking number:
+// in that range, and writes both a CSV and an Excel (.xlsx) copy of the same
+// report, one row per tracking number:
 //
 //	order id, date shipped, carrier, shipping method, tracking number, carrier scanned
 //
@@ -11,6 +12,11 @@
 // and blank if it hasn't been scanned yet, the lookup failed, the carrier
 // wasn't selected on the carrier menu, or no tracking API is configured for
 // that carrier.
+//
+// The .xlsx file is converted straight from the CSV (internal/xlsx, stdlib
+// only - no third-party dependency) and is best-effort: if it fails for some
+// reason, the CSV - the report of record - is unaffected, and a warning is
+// printed/logged instead of failing the run.
 //
 // Required environment variables:
 //
@@ -61,27 +67,28 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"math"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"internal-shipment-tracker/internal/carriers/amazon"
+	"internal-shipment-tracker/internal/carriers/fedex"
+	"internal-shipment-tracker/internal/carriers/ups"
+	"internal-shipment-tracker/internal/carriers/usps"
 	"internal-shipment-tracker/internal/env"
 	"internal-shipment-tracker/internal/goflow"
+	"internal-shipment-tracker/internal/xlsx"
 )
 
 // ---------------------------------------------------------------------------
@@ -288,27 +295,12 @@ func promptDateRange(in *bufio.Reader, out io.Writer) (start, end time.Time, err
 // Carrier tracking lookups
 // ---------------------------------------------------------------------------
 
-// retryAfterDelay parses a Retry-After header value (USPS's Tracking v3.2
-// API documents this as the number of seconds to wait before retrying a
-// rate-limited request, the same convention Goflow uses - see
-// internal/goflow's own copy of this) and rounds it up to the nearest whole
-// second. If the header is missing or unparseable, it falls back to a
-// conservative 1 second delay.
-func retryAfterDelay(header string) time.Duration {
-	header = strings.TrimSpace(header)
-	if header == "" {
-		return time.Second
-	}
-	secs, err := strconv.ParseFloat(header, 64)
-	if err != nil || secs < 0 {
-		return time.Second
-	}
-	return time.Duration(int(math.Ceil(secs))) * time.Second
-}
-
 // scanChecker reports whether a carrier has recorded at least one physical
 // scan of a shipment - i.e. it's not sitting in a "label created / awaiting
 // pickup" state, but has actually been received into the carrier's network.
+// Each carrier's actual implementation lives in its own package under
+// internal/carriers (internal/carriers/ups, /fedex, /usps, /amazon) - their
+// Checker types satisfy this interface structurally, without importing it.
 type scanChecker interface {
 	// Ping verifies that this checker's credentials actually work, without
 	// looking up any particular shipment - each implementation just does
@@ -320,31 +312,25 @@ type scanChecker interface {
 	Scanned(ctx context.Context, trackingNumber string) (bool, error)
 }
 
-// Amazon's "amazon_shipping" (Buy Shipping) service usually just resells a
-// label from a real carrier - UPS, USPS, or FedEx - at a negotiated rate.
-// When that's the case, the tracking number itself looks exactly like that
-// carrier's own format, and can be looked up directly through UPS/FedEx/USPS
-// without ever touching Amazon's SP-API (which requires seller-authorized
-// credentials). These patterns are deliberately conservative: they only
-// match formats that are distinctive enough not to collide with each other.
-var (
-	upsTrackingNumberRe   = regexp.MustCompile(`^1Z[0-9A-Z]{16}$`)
-	fedexTrackingNumberRe = regexp.MustCompile(`^\d{12}$|^\d{15}$`)
-	uspsTrackingNumberRe  = regexp.MustCompile(`^\d{20}$|^\d{22}$|^[A-Z]{2}\d{9}US$`)
-)
-
 // detectCarrierFromTrackingNumber returns "ups", "fedex", or "usps" if
 // trackingNumber's shape unambiguously matches that carrier's own tracking
 // number format, or "" if it doesn't match any of them (including if it's
-// genuinely an Amazon-only tracking ID).
+// genuinely an Amazon-only tracking ID). This is what lets an
+// "amazon_shipping" label that's really just a relabeled UPS/USPS/FedEx
+// shipment (Amazon's Buy Shipping service resells those carriers' rates) be
+// looked up directly through that carrier instead of Amazon's SP-API. Each
+// carrier package's own LooksLikeTrackingNumber is deliberately
+// conservative (only matches formats distinctive enough not to collide with
+// another carrier's own format); the order checked here (ups, usps, fedex)
+// matches the original precedence chosen when these patterns were written
+// together and should be preserved if a new one is ever added.
 func detectCarrierFromTrackingNumber(trackingNumber string) string {
-	tn := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(trackingNumber), " ", ""))
 	switch {
-	case upsTrackingNumberRe.MatchString(tn):
+	case ups.LooksLikeTrackingNumber(trackingNumber):
 		return "ups"
-	case uspsTrackingNumberRe.MatchString(tn):
+	case usps.LooksLikeTrackingNumber(trackingNumber):
 		return "usps"
-	case fedexTrackingNumberRe.MatchString(tn):
+	case fedex.LooksLikeTrackingNumber(trackingNumber):
 		return "fedex"
 	default:
 		return ""
@@ -449,603 +435,6 @@ func rateLimitFor(carrier string) carrierRateLimit {
 		return l
 	}
 	return defaultCarrierRateLimit
-}
-
-// ---- UPS -------------------------------------------------------------------
-
-type upsChecker struct {
-	clientID     string
-	clientSecret string
-	httpClient   *http.Client
-
-	mu          sync.Mutex
-	accessToken string
-	expiresAt   time.Time
-}
-
-func newUPSChecker(clientID, clientSecret string) *upsChecker {
-	return &upsChecker{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		httpClient:   &http.Client{Timeout: 20 * time.Second},
-	}
-}
-
-func (u *upsChecker) token(ctx context.Context) (string, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-
-	if u.accessToken != "" && time.Now().Before(u.expiresAt) {
-		return u.accessToken, nil
-	}
-
-	form := url.Values{}
-	form.Set("grant_type", "client_credentials")
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://onlinetools.ups.com/security/v1/oauth/token", strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.SetBasicAuth(u.clientID, u.clientSecret)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := u.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ups oauth failed (%d): %s", resp.StatusCode, string(body))
-	}
-
-	var parsed struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   string `json:"expires_in"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", err
-	}
-	secs, _ := strconv.Atoi(parsed.ExpiresIn)
-	if secs <= 60 {
-		secs = 3600
-	}
-	u.accessToken = parsed.AccessToken
-	u.expiresAt = time.Now().Add(time.Duration(secs-60) * time.Second)
-	return u.accessToken, nil
-}
-
-// Ping just does the OAuth exchange and throws away the token - if that
-// succeeds, the credentials are good.
-func (u *upsChecker) Ping(ctx context.Context) error {
-	_, err := u.token(ctx)
-	return err
-}
-
-func (u *upsChecker) Scanned(ctx context.Context, trackingNumber string) (bool, error) {
-	tok, err := u.token(ctx)
-	if err != nil {
-		return false, err
-	}
-
-	reqURL := fmt.Sprintf("https://onlinetools.ups.com/api/track/v1/details/%s", url.PathEscape(trackingNumber))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("transId", strconv.FormatInt(time.Now().UnixNano(), 10))
-	req.Header.Set("transactionSrc", "tracker")
-
-	resp, err := u.httpClient.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("ups track failed (%d): %s", resp.StatusCode, string(body))
-	}
-
-	var parsed struct {
-		TrackResponse struct {
-			Shipment []struct {
-				Package []struct {
-					Activity []struct {
-						Status struct {
-							Type string `json:"type"`
-						} `json:"status"`
-					} `json:"activity"`
-				} `json:"package"`
-			} `json:"shipment"`
-		} `json:"trackResponse"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return false, err
-	}
-
-	for _, shp := range parsed.TrackResponse.Shipment {
-		for _, pkg := range shp.Package {
-			for _, act := range pkg.Activity {
-				// UPS status type "M" = Manifest: UPS has the electronic
-				// shipment record but has NOT yet physically scanned the
-				// package. Any other type (e.g. "P" pickup, "I" in transit,
-				// "D" delivered, "X" exception) means a physical scan
-				// happened. Verify current codes against UPS's Tracking API
-				// docs if this ever looks wrong.
-				if strings.ToUpper(act.Status.Type) != "M" {
-					return true, nil
-				}
-			}
-		}
-	}
-	return false, nil
-}
-
-// ---- FedEx ------------------------------------------------------------------
-
-type fedexChecker struct {
-	clientID     string
-	clientSecret string
-	httpClient   *http.Client
-
-	mu          sync.Mutex
-	accessToken string
-	expiresAt   time.Time
-}
-
-func newFedExChecker(clientID, clientSecret string) *fedexChecker {
-	return &fedexChecker{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		httpClient:   &http.Client{Timeout: 20 * time.Second},
-	}
-}
-
-func (f *fedexChecker) token(ctx context.Context) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.accessToken != "" && time.Now().Before(f.expiresAt) {
-		return f.accessToken, nil
-	}
-
-	form := url.Values{}
-	form.Set("grant_type", "client_credentials")
-	form.Set("client_id", f.clientID)
-	form.Set("client_secret", f.clientSecret)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://apis.fedex.com/oauth/token", strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := f.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fedex oauth failed (%d): %s", resp.StatusCode, string(body))
-	}
-
-	var parsed struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", err
-	}
-	secs := parsed.ExpiresIn
-	if secs <= 60 {
-		secs = 3600
-	}
-	f.accessToken = parsed.AccessToken
-	f.expiresAt = time.Now().Add(time.Duration(secs-60) * time.Second)
-	return f.accessToken, nil
-}
-
-// Ping just does the OAuth exchange and throws away the token - if that
-// succeeds, the credentials are good.
-func (f *fedexChecker) Ping(ctx context.Context) error {
-	_, err := f.token(ctx)
-	return err
-}
-
-func (f *fedexChecker) Scanned(ctx context.Context, trackingNumber string) (bool, error) {
-	tok, err := f.token(ctx)
-	if err != nil {
-		return false, err
-	}
-
-	payload := map[string]interface{}{
-		"includeDetailedScans": true,
-		"trackingInfo": []map[string]interface{}{
-			{
-				"trackingNumberInfo": map[string]string{
-					"trackingNumber": trackingNumber,
-				},
-			},
-		},
-	}
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return false, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://apis.fedex.com/track/v1/trackingnumbers", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-locale", "en_US")
-
-	resp, err := f.httpClient.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("fedex track failed (%d): %s", resp.StatusCode, string(respBody))
-	}
-
-	var parsed struct {
-		Output struct {
-			CompleteTrackResults []struct {
-				TrackResults []struct {
-					ScanEvents []struct {
-						DerivedStatusCode string `json:"derivedStatusCode"`
-						EventType         string `json:"eventType"`
-					} `json:"scanEvents"`
-				} `json:"trackResults"`
-			} `json:"completeTrackResults"`
-		} `json:"output"`
-	}
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return false, err
-	}
-
-	for _, ctr := range parsed.Output.CompleteTrackResults {
-		for _, tr := range ctr.TrackResults {
-			for _, ev := range tr.ScanEvents {
-				code := strings.ToUpper(ev.EventType)
-				if code == "" {
-					code = strings.ToUpper(ev.DerivedStatusCode)
-				}
-				// "OC" = Order Created: FedEx has the electronic label but
-				// hasn't physically received the package yet. Any other
-				// scan code (PU pickup, AR arrived, DP departed, IT in
-				// transit, OD out for delivery, DL delivered, ...) means a
-				// physical scan happened. Verify current codes against
-				// FedEx's Track API docs if this ever looks wrong.
-				if code != "" && code != "OC" {
-					return true, nil
-				}
-			}
-		}
-	}
-	return false, nil
-}
-
-// ---- USPS -------------------------------------------------------------------
-
-type uspsChecker struct {
-	clientID     string
-	clientSecret string
-	httpClient   *http.Client
-
-	mu          sync.Mutex
-	accessToken string
-	expiresAt   time.Time
-}
-
-func newUSPSChecker(clientID, clientSecret string) *uspsChecker {
-	return &uspsChecker{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		httpClient:   &http.Client{Timeout: 20 * time.Second},
-	}
-}
-
-func (u *uspsChecker) token(ctx context.Context) (string, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-
-	if u.accessToken != "" && time.Now().Before(u.expiresAt) {
-		return u.accessToken, nil
-	}
-
-	payload := map[string]string{
-		"client_id":     u.clientID,
-		"client_secret": u.clientSecret,
-		"grant_type":    "client_credentials",
-	}
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://apis.usps.com/oauth2/v3/token", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := u.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("usps oauth failed (%d): %s", resp.StatusCode, string(respBody))
-	}
-
-	var parsed struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return "", err
-	}
-	secs := parsed.ExpiresIn
-	if secs <= 60 {
-		secs = 28800
-	}
-	u.accessToken = parsed.AccessToken
-	u.expiresAt = time.Now().Add(time.Duration(secs-60) * time.Second)
-	return u.accessToken, nil
-}
-
-// Ping just does the OAuth exchange and throws away the token - if that
-// succeeds, the credentials are good.
-func (u *uspsChecker) Ping(ctx context.Context) error {
-	_, err := u.token(ctx)
-	return err
-}
-
-// Scanned uses USPS's Tracking v3.2 (v3r2) API: a single POST /tracking
-// call whose body and response are both JSON arrays (USPS supports batching
-// up to 35 tracking numbers per call - this always sends just one). This
-// replaced the older v3 API's "GET /tracking/{trackingNumber}" shape
-// entirely; see the v3r2 OpenAPI spec for the current schema.
-func (u *uspsChecker) Scanned(ctx context.Context, trackingNumber string) (bool, error) {
-	tok, err := u.token(ctx)
-	if err != nil {
-		return false, err
-	}
-
-	payload := []map[string]string{
-		{"trackingNumber": trackingNumber},
-	}
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return false, err
-	}
-
-	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			"https://apis.usps.com/tracking/v3r2/tracking", bytes.NewReader(bodyBytes))
-		if err != nil {
-			return false, err
-		}
-		req.Header.Set("Authorization", "Bearer "+tok)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
-
-		resp, err := u.httpClient.Do(req)
-		if err != nil {
-			return false, err
-		}
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return false, readErr
-		}
-
-		if resp.StatusCode == http.StatusTooManyRequests {
-			// The v3r2 spec documents a Retry-After header (seconds) on 429s,
-			// same convention as Goflow's own rate limiting.
-			select {
-			case <-time.After(retryAfterDelay(resp.Header.Get("Retry-After"))):
-			case <-ctx.Done():
-				return false, ctx.Err()
-			}
-			continue
-		}
-
-		// 200 returns a TrackingDetails array; a batch call can also return
-		// 207 (MultiStatusResponse) where each element is either a success
-		// (tracking detail, statusCode "200") or a failure (statusCode
-		// "404" plus error info) - since exactly one tracking number was
-		// requested, at most one element comes back either way.
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusMultiStatus {
-			return false, fmt.Errorf("usps track failed (%d): %s", resp.StatusCode, string(body))
-		}
-
-		var results []struct {
-			StatusCode     string `json:"statusCode"`
-			StatusCategory string `json:"statusCategory"`
-			Error          *struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal(body, &results); err != nil {
-			return false, err
-		}
-		if len(results) == 0 {
-			return false, fmt.Errorf("usps returned no tracking result for %s", trackingNumber)
-		}
-
-		r := results[0]
-		if r.StatusCode != "" && r.StatusCode != "200" {
-			msg := r.StatusCode
-			if r.Error != nil && r.Error.Message != "" {
-				msg = r.Error.Message
-			}
-			return false, fmt.Errorf("usps could not track %s: %s", trackingNumber, msg)
-		}
-
-		// USPS explicitly labels shipments that only have an electronic label
-		// (no physical acceptance scan yet) with statusCategory "Pre-Shipment".
-		// Anything else (In Transit, Out for Delivery, Delivered, Available for
-		// Pickup, etc.) means USPS has physically scanned the package at least
-		// once. Verify against USPS's Tracking v3.2 docs if this ever looks wrong.
-		return !strings.EqualFold(r.StatusCategory, "Pre-Shipment"), nil
-	}
-}
-
-// ---- Amazon Shipping ---------------------------------------------------------
-
-// amazonShippingChecker calls Amazon's Selling Partner API (SP-API) Shipping
-// service to check tracking for the "amazon_shipping" carrier (Amazon's Buy
-// Shipping / label service - distinct from "amazon_logistics", Amazon's own
-// last-mile delivery network, which isn't handled here).
-//
-// Unlike UPS/FedEx/USPS, SP-API access tokens come from a refresh_token
-// grant (Login With Amazon), not client_credentials, because access has to
-// be tied to a specific seller's authorization - hence the extra
-// AMAZON_SHIPPING_REFRESH_TOKEN requirement.
-type amazonShippingChecker struct {
-	clientID     string
-	clientSecret string
-	refreshToken string
-	endpoint     string
-	httpClient   *http.Client
-
-	mu          sync.Mutex
-	accessToken string
-	expiresAt   time.Time
-}
-
-func newAmazonShippingChecker(clientID, clientSecret, refreshToken, endpoint string) *amazonShippingChecker {
-	return &amazonShippingChecker{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		refreshToken: refreshToken,
-		endpoint:     endpoint,
-		httpClient:   &http.Client{Timeout: 20 * time.Second},
-	}
-}
-
-func (a *amazonShippingChecker) token(ctx context.Context) (string, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.accessToken != "" && time.Now().Before(a.expiresAt) {
-		return a.accessToken, nil
-	}
-
-	form := url.Values{}
-	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", a.refreshToken)
-	form.Set("client_id", a.clientID)
-	form.Set("client_secret", a.clientSecret)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://api.amazon.com/auth/o2/token", strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("amazon shipping oauth failed (%d): %s", resp.StatusCode, string(body))
-	}
-
-	var parsed struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", err
-	}
-	secs := parsed.ExpiresIn
-	if secs <= 60 {
-		secs = 3600
-	}
-	a.accessToken = parsed.AccessToken
-	a.expiresAt = time.Now().Add(time.Duration(secs-60) * time.Second)
-	return a.accessToken, nil
-}
-
-// Ping just does the OAuth exchange and throws away the token - if that
-// succeeds, the credentials are good.
-func (a *amazonShippingChecker) Ping(ctx context.Context) error {
-	_, err := a.token(ctx)
-	return err
-}
-
-func (a *amazonShippingChecker) Scanned(ctx context.Context, trackingNumber string) (bool, error) {
-	tok, err := a.token(ctx)
-	if err != nil {
-		return false, err
-	}
-
-	reqURL := fmt.Sprintf("%s/shipping/v2/tracking/%s", strings.TrimRight(a.endpoint, "/"), url.PathEscape(trackingNumber))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return false, err
-	}
-	// SP-API operations that aren't in the "restricted data" category
-	// (tracking info is not) only need the LWA access token, not a signed
-	// AWS request. If Amazon's Shipping API rejects this for your
-	// application type, this call will need AWS SigV4 signing added.
-	req.Header.Set("x-amz-access-token", tok)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("amazon shipping track failed (%d): %s", resp.StatusCode, string(body))
-	}
-
-	var parsed struct {
-		Payload struct {
-			Summary struct {
-				Status string `json:"status"`
-			} `json:"summary"`
-			EventHistory []struct {
-				EventCode string `json:"eventCode"`
-			} `json:"eventHistory"`
-		} `json:"payload"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return false, err
-	}
-
-	// Any recorded tracking event means the package was physically scanned
-	// at least once.
-	for _, ev := range parsed.Payload.EventHistory {
-		if ev.EventCode != "" {
-			return true, nil
-		}
-	}
-	// Fall back to the overall status: "Unknown"/"LabelCreated" (naming per
-	// Amazon's Shipping API docs) mean only an electronic label exists with
-	// no physical scan yet; anything else (PickedUp, InTransit,
-	// OutForDelivery, Delivered, ...) means a scan happened. Verify against
-	// Amazon's current SP-API Shipping docs if this ever looks wrong.
-	status := strings.ToLower(parsed.Payload.Summary.Status)
-	return status != "" && status != "unknown" && status != "labelcreated", nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,7 +552,8 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "tracker")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Pulls Goflow orders marked \"shipped\" in a date range, checks carrier")
-	fmt.Fprintln(out, "tracking APIs for scan status, and writes a CSV plus a matching log file.")
+	fmt.Fprintln(out, "tracking APIs for scan status, and writes a CSV, an Excel (.xlsx) copy of")
+	fmt.Fprintln(out, "the same report, and a matching log file.")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Running it with no arguments opens an interactive menu: choose which")
 	fmt.Fprintln(out, "carrier(s) to check (or \"All\"), then enter a date range, and it runs as")
@@ -1221,16 +611,16 @@ func main() {
 	// it.
 	checkers := map[string]scanChecker{}
 	if cfg.upsClientID != "" && cfg.upsClientSecret != "" {
-		checkers["ups"] = newUPSChecker(cfg.upsClientID, cfg.upsClientSecret)
+		checkers["ups"] = ups.New(cfg.upsClientID, cfg.upsClientSecret)
 	}
 	if cfg.fedexClientID != "" && cfg.fedexClientSecret != "" {
-		checkers["fedex"] = newFedExChecker(cfg.fedexClientID, cfg.fedexClientSecret)
+		checkers["fedex"] = fedex.New(cfg.fedexClientID, cfg.fedexClientSecret)
 	}
 	if cfg.uspsClientID != "" && cfg.uspsClientSecret != "" {
-		checkers["usps"] = newUSPSChecker(cfg.uspsClientID, cfg.uspsClientSecret)
+		checkers["usps"] = usps.New(cfg.uspsClientID, cfg.uspsClientSecret)
 	}
 	if cfg.amazonShippingClientID != "" && cfg.amazonShippingClientSecret != "" && cfg.amazonShippingRefreshToken != "" {
-		checkers["amazon_shipping"] = newAmazonShippingChecker(
+		checkers["amazon_shipping"] = amazon.New(
 			cfg.amazonShippingClientID, cfg.amazonShippingClientSecret, cfg.amazonShippingRefreshToken, cfg.amazonShippingEndpoint)
 	}
 	// knownCarriers fixes the display order for the progress bars below and
@@ -1647,8 +1037,20 @@ func main() {
 		})
 	}
 
+	// Sort the CSV by carrier, then by ship date within each carrier.
+	// dateShipped is already "YYYY-MM-DD", so a plain string comparison
+	// sorts it chronologically without needing to re-parse it. Stable so
+	// rows that tie on both keys (e.g. multiple boxes on one order shipped
+	// the same day) keep the order pass 1/2 produced them in.
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].carrier != rows[j].carrier {
+			return rows[i].carrier < rows[j].carrier
+		}
+		return rows[i].dateShipped < rows[j].dateShipped
+	})
+
 	writeStart := time.Now()
-	csvPath := filepath.Join(outDir, fmt.Sprintf("shipped_orders_%s_to_%s.csv", start.Format("2006-01-02"), end.Format("2006-01-02")))
+	csvPath := filepath.Join(outDir, fmt.Sprintf("tracking_report_%s_to_%s.csv", start.Format("2006-01-02"), end.Format("2006-01-02")))
 	f, err := os.Create(csvPath)
 	if err != nil {
 		fmt.Fprintln(dualWriter(os.Stderr, logFile), "Error creating CSV file:", err)
@@ -1676,9 +1078,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Also produce an Excel (.xlsx) copy of the same report, converted
+	// straight from the CSV we just wrote (same rows, including the
+	// header) via our own internal/xlsx package - not a third-party
+	// dependency, and not shelling out to an external tool. This is
+	// best-effort: the CSV is the report of record, so a conversion
+	// failure here is logged as a warning rather than failing the run.
+	xlsxPath := filepath.Join(outDir, fmt.Sprintf("tracking_report_%s_to_%s.xlsx", start.Format("2006-01-02"), end.Format("2006-01-02")))
+	xlsxErr := xlsx.ConvertFile(csvPath, xlsxPath)
+	if xlsxErr != nil {
+		fmt.Fprintln(dualWriter(os.Stderr, logFile), "Warning: could not create Excel (.xlsx) copy of the report:", xlsxErr)
+	}
+
 	writeDuration := time.Since(writeStart)
 
 	fmt.Fprintf(dualWriter(os.Stdout, logFile), "Wrote %d row(s) to %s\n", len(rows), csvPath)
+	if xlsxErr == nil {
+		fmt.Fprintf(dualWriter(os.Stdout, logFile), "Wrote %s\n", xlsxPath)
+	}
 
 	// Timing breakdown: total wall time plus each of the major phases, so
 	// it's obvious where the time actually went (a slow Goflow fetch vs. a

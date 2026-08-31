@@ -1,8 +1,9 @@
 # tracker
 
 Opens with a menu to pick which carrier(s) to check and a date range, pulls
-shipped Goflow orders in that range, and writes a CSV: `order id, date
-shipped, carrier, shipping method, tracking number, carrier scanned`.
+shipped Goflow orders in that range, and writes a CSV (plus an Excel copy of
+the same data): `order id, date shipped, carrier, shipping method, tracking
+number, carrier scanned`.
 
 One row per tracking number (an order that ships in 3 boxes gets 3 rows).
 `carrier scanned` is `yes` if the carrier's API shows a physical scan
@@ -130,12 +131,18 @@ today" - the end date defaults to today (UTC) when omitted.
 Any invalid answer at any of these three prompts just asks again instead of
 exiting, so a typo doesn't require restarting the whole program.
 
-It will then write two files into `-dir` (the current directory by default):
-`shipped_orders_<start>_to_<end>.csv` and `logs_shipped_orders_<start>_<end>.txt`.
-The log file is a plain-text mirror of everything printed to the console
-(minus the live progress bars' ANSI redraws, which are replaced with a
-clean before/after summary per carrier) - if something goes wrong, send
-that file along and it'll show what happened, including any lookup errors.
+It will then write three files into `-dir` (the current directory by
+default): `tracking_report_<start>_to_<end>.csv`,
+`tracking_report_<start>_to_<end>.xlsx`, and
+`logs_shipped_orders_<start>_<end>.txt`. Both the CSV and the Excel file
+have identical contents (the `.xlsx` is converted straight from the CSV)
+and are sorted by carrier, then by ship date within each carrier. If the
+`.xlsx` conversion fails for some reason, the CSV is unaffected - a warning
+is printed/logged instead of the run failing. The log file is a plain-text
+mirror of everything printed to the console (minus the live progress bars'
+ANSI redraws, which are replaced with a clean before/after summary per
+carrier) - if something goes wrong, send that file along and it'll show
+what happened, including any lookup errors.
 
 Finally, it prints a timing breakdown (also mirrored into the log file):
 how long fetching orders from Goflow took, how long each carrier's tracking
@@ -146,6 +153,13 @@ to 120 sec, and minutes (one decimal place) beyond that (e.g. `420 ms`,
 
 ## Notes / caveats
 
+- The `.xlsx` file is written by this repo's own `internal/xlsx` package -
+  stdlib only, no third-party Excel library - by converting the CSV after
+  it's written. It's a single plain sheet: every cell is text (no real
+  number/date types, no formatting, no column widths), so numeric columns
+  will be left-aligned in Excel and won't be directly summable without
+  first converting them - open the CSV instead if you need real numbers to
+  do math on.
 - Goflow's API doesn't support filtering directly on `shipment.shipped_at`,
   so orders are first fetched by `status=shipped` + `status_updated_at` in
   range, then filtered client-side against the real `shipment.shipped_at`.
@@ -157,26 +171,31 @@ to 120 sec, and minutes (one decimal place) beyond that (e.g. `420 ms`,
   pull that's taking a while shows visible progress instead of going quiet
   until it's entirely done.
 - Only UPS, FedEx, USPS, and Amazon Shipping (`amazon_shipping`) tracking
-  lookups are implemented. Other carriers in Goflow's carrier list (DHL,
-  Canada Post, Purolator, Amazon Logistics, etc.) will always show a blank
-  "carrier scanned" column. The `scanChecker` interface in
-  `cmd/tracker/main.go` is there to make adding more straightforward.
+  lookups are implemented, each in its own package under
+  `internal/carriers` (`ups`, `fedex`, `usps`, `amazon`). Other carriers in
+  Goflow's carrier list (DHL, Canada Post, Purolator, Amazon Logistics,
+  etc.) will always show a blank "carrier scanned" column. The
+  `scanChecker` interface in `cmd/tracker/main.go` is there to make adding
+  another carrier package straightforward.
 - `amazon_shipping` is often just a relabeled UPS/USPS/FedEx shipment
   (Amazon's Buy Shipping service resells those carriers' rates). Before
   falling back to Amazon SP-API, `detectCarrierFromTrackingNumber` in
   `cmd/tracker/main.go` checks whether the tracking number's own format
-  unambiguously matches UPS/FedEx/USPS and, if so, looks it up through that
-  carrier's API instead - no Amazon credentials needed for those. This only
-  kicks in for tracking numbers with a distinctive-enough shape; anything
-  else still needs `AMAZON_SHIPPING_*` credentials.
+  unambiguously matches UPS/FedEx/USPS (via each carrier package's own
+  `LooksLikeTrackingNumber`) and, if so, looks it up through that carrier's
+  API instead - no Amazon credentials needed for those. This only kicks in
+  for tracking numbers with a distinctive-enough shape; anything else still
+  needs `AMAZON_SHIPPING_*` credentials.
 - The "has it been scanned" logic per carrier is a best-effort read of each
   carrier's tracking status codes (UPS activity `status.type`, FedEx
   `scanEvents` codes, USPS `statusCategory`, Amazon Shipping `eventHistory`
-  / `summary.status`). Carrier APIs change their schemas occasionally - if
-  results look wrong, check the relevant comment in `cmd/tracker/main.go`
-  against that carrier's current API docs. Amazon Shipping in particular is
-  implemented without AWS SigV4 request signing (relying on the LWA access
-  token alone); if Amazon's SP-API rejects that for your application type,
+  / `summary.status`), implemented in that carrier's own
+  `internal/carriers/<carrier>/<carrier>.go`. Carrier APIs change their
+  schemas occasionally - if results look wrong, check the relevant comment
+  above the `return` in that carrier's `Scanned` method against that
+  carrier's current API docs. Amazon Shipping in particular is implemented
+  without AWS SigV4 request signing (relying on the LWA access token
+  alone); if Amazon's SP-API rejects that for your application type,
   signing will need to be added.
 - USPS tracking uses the current Tracking v3.2 ("v3r2") API - a single
   `POST https://apis.usps.com/tracking/v3r2/tracking` call with a JSON array

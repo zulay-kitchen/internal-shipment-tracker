@@ -6,8 +6,34 @@ conventions already established rather than inventing new ones. Read
 add X" reference.
 
 Unqualified references to `main()`/`config`/etc. below mean
-`cmd/tracker/main.go` specifically, not `internal/goflow` or `internal/env`
-- see the next two sections for those.
+`cmd/tracker/main.go` specifically, not `internal/goflow`, `internal/env`,
+`internal/carriers/<carrier>`, or `internal/xlsx` - see the next few
+sections for those.
+
+## How to produce another output format from a report
+
+- If it's tabular and you already have (or can build) a `[][]string` grid
+  (header + rows), see if `internal/xlsx` already covers it -
+  `xlsx.WriteFile(path, rows)` for a fresh grid, or `xlsx.ConvertFile(csvPath,
+  xlsxPath)` if a CSV already exists (see `cmd/tracker`'s call right after
+  its own CSV write for the pattern: write the CSV first, treat it as the
+  report of record, then convert - log a `Warning:` via `dualWriter` if the
+  conversion fails rather than failing the run).
+- Before reaching for a third-party library for a new format, check whether
+  hand-rolling it is actually reasonable first, the way `internal/xlsx` did
+  for `.xlsx` - the "no dependencies" rule in AGENTS.md's design decisions
+  is a deliberate, still-current choice, not a leftover from when this
+  environment had no network access. A genuinely complex format (real
+  `.pdf` generation, for instance) might warrant revisiting that with
+  whoever owns this project - don't decide unilaterally to add a dependency
+  without calling it out and getting agreement first.
+- If you do extend `internal/xlsx` itself (real number/date cell types,
+  multiple sheets, styling, ...), re-verify the output the same way it was
+  originally verified: write a sample file and open it with a real parser,
+  not just by reading the generated XML - `openpyxl` (Python; `pip install
+  openpyxl`) is what confirmed the original implementation actually opens
+  correctly, since hand-written OOXML can be well-formed XML and still be a
+  file real spreadsheet software rejects.
 
 ## How to load environment variables in a new command
 
@@ -78,36 +104,53 @@ Unqualified references to `main()`/`config`/etc. below mean
 
 ## How to add a new carrier's tracking lookup
 
-1. Add a `<carrier>Checker` struct implementing the `scanChecker` interface
-   (`Ping(ctx context.Context) error`, `Scanned(ctx context.Context,
-   trackingNumber string) (bool, error)`), modeled on
-   `upsChecker`/`fedexChecker`/`uspsChecker`/`amazonShippingChecker`:
-   - Fields for credentials + `httpClient *http.Client`.
-   - A mutex-guarded `accessToken`/`expiresAt` pair with a `token(ctx)`
-     method that returns the cached token if still valid, otherwise does
-     the OAuth exchange and caches the result (refresh ~60s early).
-   - A `new<Carrier>Checker(...)` constructor.
-   - A `Ping` method that's just `_, err := c.token(ctx); return err` - see
-     any existing checker's `Ping` for the one-liner. Don't call the actual
-     tracking endpoint from `Ping`; it only needs to prove the credentials
-     themselves work, not that a specific tracking number is trackable.
-   - A `Scanned` method that calls the carrier's tracking endpoint and
-     returns whether at least one *physical* scan has happened (not just a
-     label/manifest).
-2. Add credential fields to the `config` struct and read them via
-   `os.Getenv` in `loadConfig()`. Add matching entries to `.env.example`,
-   `printUsage()`'s "Configuration" list, and README's env var tables.
-3. In `main()`, construct the checker into the `checkers` map only when
-   *all* of its required credentials are non-empty - never partially
-   (mirrors the existing `if cfg.xClientID != "" && cfg.xClientSecret !=
-   "" { ... }` pattern).
+1. Create `internal/carriers/<carrier>/<carrier>.go` (package `<carrier>`),
+   modeled on `internal/carriers/ups` (or `usps` if the new carrier also
+   needs 429-retry logic, or `amazon` if it uses a refresh_token grant
+   instead of client_credentials) - see AGENTS.md's
+   `internal/carriers/<carrier>` section for the shape all four already
+   share. It must not import `cmd/tracker`, `internal/goflow`, or another
+   carrier package - it's satisfying `cmd/tracker`'s `scanChecker` interface
+   structurally, not by declaration, so no such import is ever needed:
+   - A `Checker` struct: fields for credentials + `httpClient
+     *http.Client`, plus a mutex-guarded `accessToken`/`expiresAt` pair.
+   - A private `token(ctx)` method that returns the cached token if still
+     valid, otherwise does the OAuth exchange and caches the result
+     (refresh ~60s early).
+   - A `New(...)` constructor (credentials as positional params - see
+     `amazon.New`'s 4-argument form for a refresh_token carrier vs.
+     `ups.New`'s 2-argument client_credentials form).
+   - A `Ping(ctx) error` method that's just `_, err := c.token(ctx); return
+     err` - see any existing package's `Ping` for the one-liner. Don't call
+     the actual tracking endpoint from `Ping`; it only needs to prove the
+     credentials themselves work, not that a specific tracking number is
+     trackable.
+   - A `Scanned(ctx, trackingNumber) (bool, error)` method that calls the
+     carrier's tracking endpoint and returns whether at least one
+     *physical* scan has happened (not just a label/manifest).
+   - If the new carrier could plausibly be what an `amazon_shipping` label
+     actually ships through (i.e. it's a real ground carrier, not another
+     marketplace-style service), also export
+     `LooksLikeTrackingNumber(trackingNumber string) bool`, backed by a
+     private, conservative regex - see "How to add a format-detection
+     fallback" below.
+2. Add credential fields to `cmd/tracker`'s `config` struct and read them
+   via `os.Getenv` in `loadConfig()`. Add matching entries to
+   `.env.example`, `printUsage()`'s "Configuration" list, and README's env
+   var tables.
+3. In `cmd/tracker`'s `main()`, import `internal-shipment-tracker/internal/carriers/<carrier>`
+   and construct the checker into the `checkers` map only when *all* of its
+   required credentials are non-empty - never partially (mirrors the
+   existing `if cfg.xClientID != "" && cfg.xClientSecret != "" { ... }`
+   pattern).
 4. Add the carrier's exact Goflow `shipment.carrier` enum value (e.g.
    `"dhl_ecommerce"`) to the `knownCarriers` slice in `main()`. This one
    list drives the progress-bar display, the post-run tally, and the log
    snapshot - nothing else needs to know about a new carrier.
-4a. Add an entry for it to `carrierRateLimits` (near the `rateLimiter` type,
-   just above the UPS section) with a conservative `rps` (sustained
-   requests/second) and `concurrency` (worker pool size / burst) - check
+4a. Add an entry for it to `carrierRateLimits` (in the "Rate limiting"
+   section of `cmd/tracker/main.go`, alongside `rateLimiter`) with a
+   conservative `rps` (sustained requests/second) and `concurrency` (worker
+   pool size / burst) - check
    the carrier's API docs for a documented rate limit first, and err low if
    it doesn't publish one. Skipping this isn't a hard failure
    (`defaultCarrierRateLimit` covers any carrier missing from the map) but
@@ -124,9 +167,18 @@ Unqualified references to `main()`/`config`/etc. below mean
 
 ## How to add a format-detection fallback (like amazon_shipping -> UPS/FedEx/USPS)
 
-- Add a conservative regex to the `var (...)` block near
-  `detectCarrierFromTrackingNumber` - conservative means it must not
-  overlap with any other carrier's pattern.
+- Export a `LooksLikeTrackingNumber(trackingNumber string) bool` from the
+  target carrier's own `internal/carriers/<carrier>` package, backed by a
+  private, conservative regex (conservative means it must not overlap with
+  any other carrier's pattern) - see `ups.LooksLikeTrackingNumber` for the
+  pattern (normalize with `strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(trackingNumber),
+  " ", ""))` before matching, same as the other two, so precedence in
+  `detectCarrierFromTrackingNumber` stays meaningful).
+- Add a `case <carrier>.LooksLikeTrackingNumber(trackingNumber):` arm to
+  `detectCarrierFromTrackingNumber` in `cmd/tracker/main.go` - the checked
+  order there (currently ups, usps, fedex) is a precedence choice from when
+  these patterns were first written together; preserve it (append new
+  carriers at the end) rather than reordering existing ones.
 - Wire it into pass 1 of `main()`, inside the `carrier == "amazon_shipping"`
   branch (or a new sibling branch for another carrier) - only redirect to a
   carrier that's actually configured (`checkers[detected]` exists), and
