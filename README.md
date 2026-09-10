@@ -56,10 +56,12 @@ run, the same as if it had no credentials at all, instead of spending time
 on tracking lookups that would only fail the same way.
 
 Once orders are fetched, the program shows one line per carrier: a live
-progress bar while that carrier's tracking numbers are being checked, or
-`missing credentials` if it doesn't have what it needs to run at all (this
-now covers both "no credentials configured" and "credentials configured but
-failed the ping"). All configured carriers are checked in parallel, and
+progress bar while that carrier's tracking numbers are being checked, or one
+of two inactive states in place of the bar - `missing credentials` (no
+credentials configured for it at all, or credentials configured but the
+ping failed) or `not selected` (credentials are configured, but you didn't
+pick this carrier on the carrier menu). All selected carriers are checked
+in parallel, and
 within a single carrier several lookups run concurrently too - each carrier
 has its own worker pool size and requests-per-second cap (see "Notes /
 caveats" below), so it gets real concurrency without exceeding that
@@ -114,10 +116,17 @@ Only `All` plus whichever carriers actually have credentials configured (see
 Setup above) are listed - it always includes `All`, then each configured
 carrier in a fixed order (`ups`, `fedex`, `usps`, `amazon_shipping`). Answer
 with one number for a single carrier, several comma-separated numbers for a
-few, or `1` for all of them. A carrier you don't select is treated exactly
-like a carrier with no credentials configured at all for the rest of that
-run: it's skipped entirely (not even pinged - see below), and its "carrier
-scanned" column stays blank.
+few, or `1` for all of them.
+
+Picking `All` reports every order regardless of carrier, the same as this
+program has always worked - a carrier with no credentials configured just
+gets a blank "carrier scanned" column. Picking a specific carrier (or a few)
+instead is stricter: the *entire report* is limited to orders shipped by a
+carrier you picked - anything else, whether it's a carrier you simply didn't
+pick or one this program has no implementation for at all (DHL, Canada Post,
+...), is left out of the report completely rather than appearing with a
+blank column. A deselected carrier is also never pinged (see below) and
+never shows up anywhere in the log.
 
 Finally, it asks for the date range:
 
@@ -174,9 +183,11 @@ to 120 sec, and minutes (one decimal place) beyond that (e.g. `420 ms`,
   lookups are implemented, each in its own package under
   `internal/carriers` (`ups`, `fedex`, `usps`, `amazon`). Other carriers in
   Goflow's carrier list (DHL, Canada Post, Purolator, Amazon Logistics,
-  etc.) will always show a blank "carrier scanned" column. The
-  `scanChecker` interface in `cmd/tracker/main.go` is there to make adding
-  another carrier package straightforward.
+  etc.) will always show a blank "carrier scanned" column when `All` is
+  selected on the carrier menu (they're omitted from the report entirely
+  otherwise - see the carrier-menu section above). The `scanChecker`
+  interface in `cmd/tracker/main.go` is there to make adding another
+  carrier package straightforward.
 - `amazon_shipping` is often just a relabeled UPS/USPS/FedEx shipment
   (Amazon's Buy Shipping service resells those carriers' rates). Before
   falling back to Amazon SP-API, `detectCarrierFromTrackingNumber` in
@@ -222,9 +233,11 @@ to 120 sec, and minutes (one decimal place) beyond that (e.g. `420 ms`,
 - Carrier selection (the welcome menu's second prompt) is applied before
   the ping pass, not after: a carrier you don't select is dropped from
   consideration immediately, so it never gets pinged, never shows up in the
-  ping log, and can never trigger the high-error-rate `ALERT` below either -
-  from that carrier's perspective, not selecting it looks identical to
-  never having configured its credentials at all.
+  ping log, and can never trigger the high-error-rate `ALERT` below either.
+  It goes further than that, though: unlike a never-configured carrier
+  under `All` (which still shows up with a blank "carrier scanned"),
+  deselecting a specific carrier removes its orders from the report
+  entirely - see the carrier-menu section above.
 - Every carrier with credentials configured *and selected on the carrier
   menu* gets an initial ping (an OAuth token request, nothing more) before
   any tracking lookups happen. A

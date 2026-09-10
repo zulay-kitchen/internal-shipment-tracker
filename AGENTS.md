@@ -246,10 +246,17 @@ itself; this is the same order:
    prompt, re-prompts on a bad answer instead of failing), and
    `promptCarrierSelection` (the "All" + per-carrier multi-select prompt,
    built on the same numbered-list convention, parsing comma-separated
-   numbers). Both take a `*bufio.Reader` rather than an `io.Reader` -
-   see the note on `promptMenu` and the "shared stdin reader" bullet under
-   `main()` below for why that's not just `promptDateRange`'s own
-   `bufio.NewReader(in)` pattern repeated.
+   numbers). `promptCarrierSelection` returns `(chosen []string, all bool,
+   err error)` - `all` specifically distinguishes "the user picked All"
+   from "the user happened to pick every available carrier individually"
+   (the `chosen` slice is identical either way, so this couldn't be
+   recovered from `chosen` alone): only the former should still report
+   orders from carriers this program has no credentials/implementation for
+   at all; see pass 1 in `main()` below. Both prompt functions take a
+   `*bufio.Reader` rather than an `io.Reader` - see the note on
+   `promptMenu` and the "shared stdin reader" bullet under `main()` below
+   for why that's not just `promptDateRange`'s own `bufio.NewReader(in)`
+   pattern repeated.
 3. **Date range prompt** - `promptDateRange`, `dateRangeRe`. Accepts either
    `YYYY-MM-DD to YYYY-MM-DD` or a single `YYYY-MM-DD` (end defaults to
    today, UTC). Also takes the shared `*bufio.Reader`, for the same reason.
@@ -283,10 +290,16 @@ itself; this is the same order:
    - **Carrier selection**: build `availableCarriers` from `knownCarriers`
      filtered to what's actually in `checkers` (i.e. has credentials
      configured), error out if that's empty, then call
-     `promptCarrierSelection`. Any carrier not in the result gets `delete`d
-     from `checkers` - from here on a deselected carrier is indistinguishable
-     from one with no credentials at all, the same trick the ping pass
-     below relies on.
+     `promptCarrierSelection`, capturing both the chosen carriers and
+     `selectedAllCarriers`. Any carrier not chosen gets `delete`d from
+     `checkers` - from here on a deselected carrier is indistinguishable
+     from one with no credentials at all for scan-checking purposes, the
+     same trick the ping pass below relies on. `selectedAllCarriers` is
+     carried all the way into pass 1, where it decides something stronger:
+     whether orders from carriers outside the chosen set are reported at
+     all (see pass 1 below) - deselecting is not just "skip the lookup,"
+     it's "leave this carrier out of the report entirely" unless `All` was
+     picked.
    - Prompt for the date range, open the log file (named
      `logs_shipped_orders_<start>_<end>.txt`).
    - **Ping pass**: for each `knownCarriers` entry present in `checkers`,
@@ -302,13 +315,26 @@ itself; this is the same order:
    - Build a `goflow.NewClient(cfg.goflowSubdomain, cfg.goflowToken)`, point
      its `Notice` at `dualWriter(os.Stdout, logFile)`, then call
      `goflowClient.FetchShippedOrders(ctx, start, endExclusive)`, timed.
-   - **Pass 1** (single-threaded, no network calls): for every order and
-     tracking number, resolve the "lookup carrier" (handles the
+   - **Pass 1** (single-threaded, no network calls): for every order, first
+     `continue` past it entirely if `!selectedAllCarriers &&
+     !selected[carrier]` - a carrier the user didn't pick (whether or not
+     it even has a checker) never gets a `pending` row at all, so it's
+     absent from the CSV/xlsx, not just blank. Only past that filter does
+     it resolve the "lookup carrier" for each tracking number (handles the
      amazon_shipping fallback), build de-duplicated per-carrier queues, and
      build `pending` rows.
    - Build the initial progress display (one line per `knownCarriers`
-     entry: live bar, or "missing credentials"/"no tracking numbers" with a
-     real `0/<total>` count).
+     entry: a live bar, or "missing credentials"/"not selected"/"no
+     tracking numbers" with a real `0/<total>` count in place of it).
+     `wasAvailable` (built from `availableCarriers`) is what lets this tell
+     "never had credentials" apart from "had credentials but wasn't picked
+     on the carrier menu" - both end up absent from `checkers` by this
+     point, so `checkers` alone can't distinguish them: `!wasAvailable[carrier]`
+     means "missing credentials"; `wasAvailable[carrier] &&
+     (!selectedAllCarriers && !selected[carrier])` means "not selected";
+     anything else absent from `checkers` at this point had credentials
+     *and* was selected, so it must have failed its ping - still rendered
+     as "missing credentials" (not distinguished further today).
    - Spawn one goroutine per carrier that has credentials and a non-empty
      queue - carriers run concurrently with each other. Within a carrier's
      goroutine, tracking numbers are fanned out over a channel to a small
@@ -363,8 +389,8 @@ itself; this is the same order:
   before/after snapshot is logged instead). Use `dualWriter(...)` for
   anything that should hit both.
 - **Progress-bar alignment matters to the user** - active bars and inactive
-  ("missing credentials" / "no tracking numbers") lines must render in
-  identical columns; that's why `renderProgressText` mirrors
+  ("missing credentials" / "not selected" / "no tracking numbers") lines
+  must render in identical columns; that's why `renderProgressText` mirrors
   `renderProgressBar`'s layout instead of using a different format.
 - **No compiler was available while building the bulk of this** (sandboxed,
   no network). Early changes were verified by hand: counting `(`/`)` and

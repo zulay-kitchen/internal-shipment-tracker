@@ -9,9 +9,14 @@
 //
 // "carrier scanned" is "yes" if the carrier's tracking API shows at least one
 // physical scan (the package has actually been received into their network),
-// and blank if it hasn't been scanned yet, the lookup failed, the carrier
-// wasn't selected on the carrier menu, or no tracking API is configured for
-// that carrier.
+// and blank if it hasn't been scanned yet, the lookup failed, or no tracking
+// API is configured for that carrier.
+//
+// Picking "All" on the carrier menu reports every order regardless of
+// carrier, same as always. Picking a specific carrier (or several) instead
+// restricts the *entire report* to orders whose carrier was picked - an
+// order shipped by a carrier you didn't pick, known to this program or not,
+// is omitted entirely rather than appearing with a blank "carrier scanned".
 //
 // The .xlsx file is converted straight from the CSV (internal/xlsx, stdlib
 // only - no third-party dependency) and is best-effort: if it fails for some
@@ -190,10 +195,17 @@ func promptMenu(in *bufio.Reader, out io.Writer, title string, options []string)
 // re-prompting until it gets a well-formed answer. Accepts one or more
 // numbers separated by commas, e.g. "2,3"; selecting "All" (always option
 // 1) selects every carrier passed in, regardless of anything else also
-// typed alongside it.
+// typed alongside it, and reports all=true - callers use that to tell "the
+// user picked every available carrier by explicitly asking for All" apart
+// from "the user picked a specific subset that happens to be everyone,"
+// even though the returned carrier list is identical either way: only the
+// former means orders from carriers this program doesn't even have
+// credentials for should still be reported (blank "carrier scanned") -
+// picking a specific subset means anything outside that subset, known
+// carrier or not, is omitted from the report entirely (see main()'s pass 1).
 //
 // in must be the same shared *bufio.Reader described on promptMenu.
-func promptCarrierSelection(in *bufio.Reader, out io.Writer, carriers []string) ([]string, error) {
+func promptCarrierSelection(in *bufio.Reader, out io.Writer, carriers []string) (chosen []string, all bool, err error) {
 	options := append([]string{"All"}, carriers...)
 	for {
 		fmt.Fprintln(out, "\nWhich carriers would you like to check?")
@@ -206,7 +218,7 @@ func promptCarrierSelection(in *bufio.Reader, out io.Writer, carriers []string) 
 		line = strings.TrimSpace(line)
 		if line == "" {
 			if readErr != nil {
-				return nil, fmt.Errorf("failed to read input: %w", readErr)
+				return nil, false, fmt.Errorf("failed to read input: %w", readErr)
 			}
 			fmt.Fprintln(out, "Please make a selection.")
 			continue
@@ -228,15 +240,15 @@ func promptCarrierSelection(in *bufio.Reader, out io.Writer, carriers []string) 
 		}
 
 		if selected[1] {
-			return carriers, nil
+			return carriers, true, nil
 		}
-		var chosen []string
+		var picked []string
 		for i, carrier := range carriers {
 			if selected[i+2] { // options[0] is "All"; carriers[i] is options[i+1]
-				chosen = append(chosen, carrier)
+				picked = append(picked, carrier)
 			}
 		}
-		return chosen, nil
+		return picked, false, nil
 	}
 }
 
@@ -670,7 +682,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: no carrier credentials are configured (UPS/FedEx/USPS/Amazon Shipping) - nothing to check.")
 		os.Exit(1)
 	}
-	selectedCarriers, err := promptCarrierSelection(stdin, os.Stdout, availableCarriers)
+	selectedCarriers, selectedAllCarriers, err := promptCarrierSelection(stdin, os.Stdout, availableCarriers)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
@@ -787,6 +799,16 @@ func main() {
 		if o.Shipment.Carrier != nil {
 			carrier = *o.Shipment.Carrier
 		}
+		if !selectedAllCarriers && !selected[carrier] {
+			// The user picked a specific subset of carriers (not "All") on
+			// the carrier menu, and this order's reported carrier isn't in
+			// it - omit it from the report entirely, not just from scan
+			// checks. This is stricter than "no credentials for this
+			// carrier" (which still reports the order with a blank
+			// "carrier scanned" column): a deliberate carrier choice means
+			// every other carrier, known or not, is left out completely.
+			continue
+		}
 		shippingMethod := ""
 		if o.Shipment.ShippingMethod != nil {
 			shippingMethod = *o.Shipment.ShippingMethod
@@ -857,19 +879,37 @@ func main() {
 		}
 	}
 
+	// wasAvailable marks carriers that had credentials configured (i.e.
+	// were actually offered on the carrier-selection menu), so the
+	// progress display below can tell "never had credentials" apart from
+	// "had credentials, just wasn't picked."
+	wasAvailable := make(map[string]bool, len(availableCarriers))
+	for _, carrier := range availableCarriers {
+		wasAvailable[carrier] = true
+	}
+
 	// Build the initial progress display: one line per known carrier,
-	// either a live progress bar (credentials found and there's work to
-	// do) or a same-width line with "missing credentials" (or "no tracking
-	// numbers to check") in place of the bar - tracking numbers are still
-	// counted either way, so the total on the right stays visible and every
-	// line lines up in the same columns.
+	// either a live progress bar (credentials found, selected, and there's
+	// work to do) or a same-width line in place of the bar - "missing
+	// credentials", "not selected", or "no tracking numbers to check" -
+	// tracking numbers are still counted either way, so the total on the
+	// right stays visible and every line lines up in the same columns.
 	lineIndex := make(map[string]int, len(knownCarriers))
 	initialLines := make([]string, 0, len(knownCarriers))
 	for _, carrier := range knownCarriers {
 		lineIndex[carrier] = len(initialLines)
 		total := len(queues[carrier])
 		if _, ok := checkers[carrier]; !ok {
-			initialLines = append(initialLines, renderProgressText(carrier, " missing credentials", 0, total))
+			switch {
+			case !wasAvailable[carrier]:
+				initialLines = append(initialLines, renderProgressText(carrier, " missing credentials", 0, total))
+			case !selectedAllCarriers && !selected[carrier]:
+				initialLines = append(initialLines, renderProgressText(carrier, " not selected", 0, total))
+			default:
+				// Had credentials and was selected, so the only way it's
+				// still missing from checkers is a failed ping.
+				initialLines = append(initialLines, renderProgressText(carrier, " missing credentials", 0, total))
+			}
 			continue
 		}
 		if total == 0 {
