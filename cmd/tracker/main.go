@@ -41,6 +41,11 @@
 //	FEDEX_CLIENT_ID / FEDEX_CLIENT_SECRET   FedEx OAuth client credentials
 //	USPS_CLIENT_ID / USPS_CLIENT_SECRET     USPS OAuth client credentials
 //
+//	STAMPS_CLIENT_ID       Stamps.com/Endicia (SERA) OAuth client ID
+//	STAMPS_CLIENT_SECRET   Stamps.com/Endicia (SERA) OAuth client secret
+//	STAMPS_REFRESH_TOKEN   optional - see below
+//	STAMPS_REDIRECT_URI    optional - see below
+//
 //	AMAZON_SHIPPING_CLIENT_ID       Amazon Shipping (SP-API) LWA client ID
 //	AMAZON_SHIPPING_CLIENT_SECRET   Amazon Shipping (SP-API) LWA client secret
 //	AMAZON_SHIPPING_REFRESH_TOKEN   Amazon Shipping (SP-API) LWA refresh token
@@ -51,6 +56,24 @@
 // AMAZON_SHIPPING_CLIENT_SECRET and AMAZON_SHIPPING_REFRESH_TOKEN - if any
 // one of them is missing, Amazon Shipping tracking lookups are skipped just
 // like any other carrier without full credentials.
+//
+// Stamps.com/Endicia isn't a separate carrier - it's an alternative to
+// USPS_CLIENT_ID/USPS_CLIENT_SECRET for checking "usps" tracking. If
+// STAMPS_CLIENT_ID and STAMPS_CLIENT_SECRET are both set, Stamps.com is
+// used for "usps" regardless of whether native USPS credentials are also
+// set; native USPS is only used as a fallback when Stamps.com isn't
+// configured. STAMPS_REFRESH_TOKEN is optional: if you already have one,
+// set it and it's used immediately; if you leave it blank, the first
+// carrier ping logs you in interactively instead - it starts a temporary
+// local HTTP server, prints a signin.stampsendicia.com URL for you to open
+// in a browser, waits (up to 5 minutes) for you to log in, and caches the
+// resulting tokens in memory for the rest of that run (nothing is written
+// to disk automatically, though the obtained refresh token is printed once
+// so you can save it to STAMPS_REFRESH_TOKEN yourself to skip logging in
+// next time). STAMPS_REDIRECT_URI overrides the local callback address
+// (default "http://localhost:8080/callback") - whichever value is in
+// effect must be registered as a valid redirect URI for STAMPS_CLIENT_ID in
+// the Stamps.com/Endicia developer console, or the login will fail.
 //
 // Any of the above may instead be placed in a ".env" file next to this
 // program's source (or its compiled binary), one KEY=VALUE per line. Actual
@@ -89,6 +112,7 @@ import (
 
 	"internal-shipment-tracker/internal/carriers/amazon"
 	"internal-shipment-tracker/internal/carriers/fedex"
+	"internal-shipment-tracker/internal/carriers/stamps"
 	"internal-shipment-tracker/internal/carriers/ups"
 	"internal-shipment-tracker/internal/carriers/usps"
 	"internal-shipment-tracker/internal/env"
@@ -113,6 +137,11 @@ type config struct {
 	uspsClientID     string
 	uspsClientSecret string
 
+	stampsClientID     string
+	stampsClientSecret string
+	stampsRefreshToken string
+	stampsRedirectURI  string
+
 	amazonShippingClientID     string
 	amazonShippingClientSecret string
 	amazonShippingRefreshToken string
@@ -132,6 +161,11 @@ func loadConfig() (config, error) {
 
 		uspsClientID:     os.Getenv("USPS_CLIENT_ID"),
 		uspsClientSecret: os.Getenv("USPS_CLIENT_SECRET"),
+
+		stampsClientID:     os.Getenv("STAMPS_CLIENT_ID"),
+		stampsClientSecret: os.Getenv("STAMPS_CLIENT_SECRET"),
+		stampsRefreshToken: os.Getenv("STAMPS_REFRESH_TOKEN"),
+		stampsRedirectURI:  os.Getenv("STAMPS_REDIRECT_URI"),
 
 		amazonShippingClientID:     os.Getenv("AMAZON_SHIPPING_CLIENT_ID"),
 		amazonShippingClientSecret: os.Getenv("AMAZON_SHIPPING_CLIENT_SECRET"),
@@ -584,6 +618,8 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  UPS_CLIENT_ID / UPS_CLIENT_SECRET                             optional")
 	fmt.Fprintln(out, "  FEDEX_CLIENT_ID / FEDEX_CLIENT_SECRET                         optional")
 	fmt.Fprintln(out, "  USPS_CLIENT_ID / USPS_CLIENT_SECRET                           optional")
+	fmt.Fprintln(out, "  STAMPS_CLIENT_ID / _CLIENT_SECRET                             optional")
+	fmt.Fprintln(out, "  STAMPS_REFRESH_TOKEN / _REDIRECT_URI                          optional")
 	fmt.Fprintln(out, "  AMAZON_SHIPPING_CLIENT_ID / _CLIENT_SECRET / _REFRESH_TOKEN   optional")
 	fmt.Fprintln(out, "  AMAZON_SHIPPING_ENDPOINT                                      optional")
 }
@@ -628,7 +664,21 @@ func main() {
 	if cfg.fedexClientID != "" && cfg.fedexClientSecret != "" {
 		checkers["fedex"] = fedex.New(cfg.fedexClientID, cfg.fedexClientSecret)
 	}
-	if cfg.uspsClientID != "" && cfg.uspsClientSecret != "" {
+	// Stamps.com/Endicia (SERA) takes priority over the native USPS
+	// Tracking API for "usps" when its credentials are present, regardless
+	// of whether native USPS credentials are also configured - see
+	// AGENTS.md for why. Only fall back to the native USPS API when
+	// Stamps.com isn't configured at all.
+	//
+	// Unlike the other carriers, only client ID/secret are required here,
+	// not a refresh token: if STAMPS_REFRESH_TOKEN is blank, stamps.New's
+	// Checker obtains one itself on first use via an interactive login
+	// (see internal/carriers/stamps's doc comment) and caches it in memory
+	// for the rest of this run.
+	switch {
+	case cfg.stampsClientID != "" && cfg.stampsClientSecret != "":
+		checkers["usps"] = stamps.New(cfg.stampsClientID, cfg.stampsClientSecret, cfg.stampsRefreshToken, cfg.stampsRedirectURI)
+	case cfg.uspsClientID != "" && cfg.uspsClientSecret != "":
 		checkers["usps"] = usps.New(cfg.uspsClientID, cfg.uspsClientSecret)
 	}
 	if cfg.amazonShippingClientID != "" && cfg.amazonShippingClientSecret != "" && cfg.amazonShippingRefreshToken != "" {

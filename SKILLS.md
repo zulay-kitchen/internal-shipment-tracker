@@ -104,11 +104,35 @@ sections for those.
 
 ## How to add a new carrier's tracking lookup
 
+0. First decide: is this a genuinely new Goflow carrier value (like
+   `ups`/`fedex`/`usps`/`amazon_shipping`), or is it a reseller/consolidator
+   API that stands in for tracking an *existing* carrier value - the way
+   `stamps` (Stamps.com/Endicia's SERA API) is an alternative way to check
+   `"usps"`, not a carrier of its own? If it's the latter:
+   - It still gets its own `internal/carriers/<name>` package (step 1
+     below), but it does *not* get its own entry in `knownCarriers` or its
+     own key in `checkers` - it competes for the *existing* carrier's key.
+   - In `main()`, replace the existing carrier's plain `if
+     cfg.xClientID != "" && ... { checkers["x"] = x.New(...) }` with a
+     `switch` that tries the new implementation's full credential set
+     first and falls back to the existing one - see `checkers["usps"]`'s
+     `switch` (stamps.New(...) vs usps.New(...)) for the exact pattern. Get
+     explicit confirmation from whoever's asking for the precedence order
+     (which one wins when both are configured) rather than guessing - it's
+     a real behavioral choice with no obviously-correct default, and it's
+     what actually happened when `stamps` was added (see AGENTS.md's
+     `checkers["usps"]` note and this file's git history/commit message
+     for that decision).
+   - Nothing else needs to change - rate limiting (`carrierRateLimits`),
+     progress bars, the ping pass, the high-error-rate `ALERT`, and the
+     CSV/xlsx `carrier` column all key off the shared carrier string
+     (`"usps"` in this example) and don't know or care which underlying
+     package is actually answering `Scanned`/`Ping` for it.
 1. Create `internal/carriers/<carrier>/<carrier>.go` (package `<carrier>`),
    modeled on `internal/carriers/ups` (or `usps` if the new carrier also
-   needs 429-retry logic, or `amazon` if it uses a refresh_token grant
-   instead of client_credentials) - see AGENTS.md's
-   `internal/carriers/<carrier>` section for the shape all four already
+   needs 429-retry logic, or `amazon`/`stamps` if it uses a refresh_token
+   grant instead of client_credentials) - see AGENTS.md's
+   `internal/carriers/<carrier>` section for the shape all five already
    share. It must not import `cmd/tracker`, `internal/goflow`, or another
    carrier package - it's satisfying `cmd/tracker`'s `scanChecker` interface
    structurally, not by declaration, so no such import is ever needed:
@@ -125,6 +149,18 @@ sections for those.
      the actual tracking endpoint from `Ping`; it only needs to prove the
      credentials themselves work, not that a specific tracking number is
      trackable.
+   - If the credential you'd otherwise require up front (a refresh token,
+     typically) can only be obtained via a browser-based login and you'd
+     rather not force the caller to go get one out-of-band first, see
+     `stamps`'s `authorizeLocked`/`exchangeCodeLocked` for the pattern: a
+     temporary local `net/http` server to receive the OAuth redirect, a
+     printed URL for the user to open by hand (don't auto-launch a
+     browser - see that package's comments for why), a bounded wait (5
+     minutes there), and caching the result in memory on the `Checker`
+     only - never write a secret like this to disk automatically. Trigger
+     it lazily from inside `token(ctx)` when the credential is missing,
+     not from `New`, so `New` itself stays a simple, non-blocking,
+     non-erroring constructor like every other carrier's.
    - A `Scanned(ctx, trackingNumber) (bool, error)` method that calls the
      carrier's tracking endpoint and returns whether at least one
      *physical* scan has happened (not just a label/manifest).

@@ -36,6 +36,11 @@ FEDEX_CLIENT_SECRET=...
 USPS_CLIENT_ID=...
 USPS_CLIENT_SECRET=...
 
+STAMPS_CLIENT_ID=...
+STAMPS_CLIENT_SECRET=...
+STAMPS_REFRESH_TOKEN=...      # optional - see below
+STAMPS_REDIRECT_URI=...       # optional, defaults to http://localhost:8080/callback
+
 AMAZON_SHIPPING_CLIENT_ID=...
 AMAZON_SHIPPING_CLIENT_SECRET=...
 AMAZON_SHIPPING_REFRESH_TOKEN=...
@@ -48,6 +53,30 @@ client ID + secret). Amazon Shipping is SP-API, which requires a
 refresh_token grant tied to a seller's authorization, so all three of
 AMAZON_SHIPPING_CLIENT_ID/_SECRET/_REFRESH_TOKEN must be set together or
 Amazon Shipping lookups are skipped.
+
+`STAMPS_CLIENT_ID`/`_CLIENT_SECRET` (Stamps.com/Endicia's SERA API, also a
+refresh_token grant) aren't a separate carrier - they're an *alternative*
+way to check `usps` tracking, for accounts that ship USPS through
+Stamps.com/Endicia rather than (or in addition to) holding direct USPS Web
+Tools credentials. If both are set, Stamps.com is used for `usps`
+tracking - even if `USPS_CLIENT_ID`/`_CLIENT_SECRET` are *also* set. The
+native USPS API (`USPS_CLIENT_ID`/`_CLIENT_SECRET`) is only used when
+Stamps.com isn't configured at all.
+
+Unlike every other carrier here, `STAMPS_REFRESH_TOKEN` doesn't have to be
+set in advance. If it's blank, the first time tracker needs a Stamps.com
+token (during the ping pass, below) it logs you in interactively instead:
+it prints a `signin.stampsendicia.com` login URL to the console and waits
+up to 5 minutes for you to open it in a browser and log in. Once you do,
+it caches the resulting access and refresh tokens **in memory for that run
+only** - nothing is written back to `.env` automatically - and also prints
+the refresh token once, so you can copy it into `STAMPS_REFRESH_TOKEN`
+yourself if you'd rather not log in again next time. This only works if
+`STAMPS_REDIRECT_URI` (or its default, `http://localhost:8080/callback`)
+is already registered as a valid redirect URI for `STAMPS_CLIENT_ID` in
+the Stamps.com/Endicia developer console - and it needs a human at a
+terminal with a browser, so don't rely on it for unattended/scheduled
+runs; set `STAMPS_REFRESH_TOKEN` up front for those.
 
 Before fetching orders, the program pings every carrier that has credentials
 configured - just an OAuth token request, logged as `<carrier> ping ok` or
@@ -181,13 +210,14 @@ to 120 sec, and minutes (one decimal place) beyond that (e.g. `420 ms`,
   until it's entirely done.
 - Only UPS, FedEx, USPS, and Amazon Shipping (`amazon_shipping`) tracking
   lookups are implemented, each in its own package under
-  `internal/carriers` (`ups`, `fedex`, `usps`, `amazon`). Other carriers in
-  Goflow's carrier list (DHL, Canada Post, Purolator, Amazon Logistics,
-  etc.) will always show a blank "carrier scanned" column when `All` is
-  selected on the carrier menu (they're omitted from the report entirely
-  otherwise - see the carrier-menu section above). The `scanChecker`
-  interface in `cmd/tracker/main.go` is there to make adding another
-  carrier package straightforward.
+  `internal/carriers` (`ups`, `fedex`, `usps`, `amazon`, plus `stamps` as
+  an alternative implementation for `usps` - see Setup above). Other
+  carriers in Goflow's carrier list (DHL, Canada Post, Purolator, Amazon
+  Logistics, etc.) will always show a blank "carrier scanned" column when
+  `All` is selected on the carrier menu (they're omitted from the report
+  entirely otherwise - see the carrier-menu section above). The
+  `scanChecker` interface in `cmd/tracker/main.go` is there to make adding
+  another carrier package straightforward.
 - `amazon_shipping` is often just a relabeled UPS/USPS/FedEx shipment
   (Amazon's Buy Shipping service resells those carriers' rates). Before
   falling back to Amazon SP-API, `detectCarrierFromTrackingNumber` in
@@ -200,7 +230,8 @@ to 120 sec, and minutes (one decimal place) beyond that (e.g. `420 ms`,
 - The "has it been scanned" logic per carrier is a best-effort read of each
   carrier's tracking status codes (UPS activity `status.type`, FedEx
   `scanEvents` codes, USPS `statusCategory`, Amazon Shipping `eventHistory`
-  / `summary.status`), implemented in that carrier's own
+  / `summary.status`, Stamps.com/SERA's standardized `status_code`),
+  implemented in that carrier's own
   `internal/carriers/<carrier>/<carrier>.go`. Carrier APIs change their
   schemas occasionally - if results look wrong, check the relevant comment
   above the `return` in that carrier's `Scanned` method against that

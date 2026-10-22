@@ -68,6 +68,19 @@ carrier's vars are present):
 - `UPS_CLIENT_ID` / `UPS_CLIENT_SECRET`
 - `FEDEX_CLIENT_ID` / `FEDEX_CLIENT_SECRET`
 - `USPS_CLIENT_ID` / `USPS_CLIENT_SECRET`
+- `STAMPS_CLIENT_ID` / `STAMPS_CLIENT_SECRET` (required together) +
+  optional `STAMPS_REFRESH_TOKEN` / `STAMPS_REDIRECT_URI` - not a separate
+  carrier slot; this is an alternative to
+  `USPS_CLIENT_ID`/`USPS_CLIENT_SECRET` for the same `"usps"` slot in
+  `checkers`. If `STAMPS_CLIENT_ID`/`_CLIENT_SECRET` are both set,
+  Stamps.com/Endicia (SERA) is used for `"usps"` regardless of whether
+  native USPS credentials are also set; native USPS is only used when
+  Stamps.com isn't configured at all. Unlike every other carrier here,
+  `STAMPS_REFRESH_TOKEN` is optional up front: if it's blank,
+  `internal/carriers/stamps` obtains one itself via an interactive login
+  the first time a token is needed, and caches it in memory for that run -
+  see `internal/carriers/stamps` below for the mechanics and
+  `STAMPS_REDIRECT_URI`'s role in it.
 - `AMAZON_SHIPPING_CLIENT_ID` / `AMAZON_SHIPPING_CLIENT_SECRET` /
   `AMAZON_SHIPPING_REFRESH_TOKEN` (+ optional `AMAZON_SHIPPING_ENDPOINT`)
 
@@ -87,12 +100,22 @@ list.
   implementation lives in its own `internal/carriers/<carrier>` package
   (see below), not here.
 - `internal/carriers/ups/ups.go`, `internal/carriers/fedex/fedex.go`,
-  `internal/carriers/usps/usps.go`, `internal/carriers/amazon/amazon.go` -
-  one self-contained client package per carrier, each exposing a `Checker`
-  type (`New(...)` constructor, `Ping(ctx) error`, `Scanned(ctx,
-  trackingNumber) (bool, error)`) plus - for ups/fedex/usps, the three
-  carriers `detectCarrierFromTrackingNumber` can fall back to -
-  `LooksLikeTrackingNumber(trackingNumber string) bool`. None of these
+  `internal/carriers/usps/usps.go`, `internal/carriers/amazon/amazon.go`,
+  `internal/carriers/stamps/stamps.go` - one self-contained client package
+  per carrier/carrier-API, each exposing a `Checker` type (`New(...)`
+  constructor, `Ping(ctx) error`, `Scanned(ctx, trackingNumber) (bool,
+  error)`) plus - for ups/fedex/usps, the three carriers
+  `detectCarrierFromTrackingNumber` can fall back to -
+  `LooksLikeTrackingNumber(trackingNumber string) bool`. `stamps` is the
+  odd one out in two ways: it's not a distinct Goflow carrier value, it's
+  an *alternative implementation* for the same `"usps"` slot in `checkers`
+  (Stamps.com/Endicia's SERA API, a reseller that stands in for the native
+  USPS Tracking API when configured - see "Configuration" above and the
+  `checkers` construction in `main()` below for the precedence rule), so it
+  has no `LooksLikeTrackingNumber` of its own; and it's the only one of the
+  five that can obtain its own long-lived credential (a refresh token) at
+  runtime via an interactive login, rather than requiring one to already
+  exist in the environment - see its own section below. None of these
   packages import `cmd/tracker` or each other; `cmd/tracker`'s `scanChecker`
   interface is satisfied structurally (Go doesn't require a package to
   import an interface to implement it), so there's no import cycle and each
@@ -202,37 +225,76 @@ list.
   so a caller watching `Notice` can tell pagination is still in progress
   rather than the pull having stalled.
 
-### `internal/carriers/<carrier>/<carrier>.go` (ups, fedex, usps, amazon)
+### `internal/carriers/<carrier>/<carrier>.go` (ups, fedex, usps, amazon, stamps)
 
-Each of the four follows the identical shape (copy the closest existing one
+Each of the five follows the identical shape (copy the closest existing one
 when adding a new carrier - see SKILLS.md):
 
 - A private `token(ctx) (string, error)` method, mutex-guarded, caching the
   OAuth access token and refreshing ~60s before it actually expires.
   UPS/FedEx/USPS use a client_credentials grant (`New(clientID,
-  clientSecret string)`); `amazon` uses a refresh_token grant instead
-  (`New(clientID, clientSecret, refreshToken, endpoint string)`) since
-  SP-API access has to be tied to a specific seller's authorization.
-- `Ping(ctx) error` - the same one-liner in all four: call `token(ctx)`,
+  clientSecret string)`); `amazon` (`New(clientID, clientSecret,
+  refreshToken, endpoint string)`) and `stamps` (`New(clientID,
+  clientSecret, refreshToken, redirectURI string)`) use a refresh_token
+  grant instead, since both SP-API and SERA access have to be tied to a
+  specific seller/user's authorization via a login flow, not just an
+  app-level secret. `amazon` always requires its `refreshToken` to already
+  exist (obtained out-of-band, before this program ever runs); `stamps` is
+  the one exception across all five packages - see the next paragraph.
+- **`stamps`'s interactive login**: if `refreshToken` passed to `New` is
+  empty, `token(ctx)` (called from `Ping` or `Scanned`) calls
+  `authorizeLocked`, which performs SERA's OAuth `authorization_code` flow
+  itself rather than erroring out: it starts a temporary local
+  `net/http` server bound to `redirectURI` (or `defaultRedirectURI`,
+  `"http://localhost:8080/callback"`, if that's also empty), prints the
+  `/authorize` login URL to `os.Stdout` for the user to open by hand
+  (deliberately not auto-opened - see `internal/carriers/stamps`'s own
+  comments for why), and blocks (holding `Checker.mu` - see below) for up
+  to 5 minutes waiting for the callback. Once a `code` arrives,
+  `exchangeCodeLocked` trades it for an access token *and* a refresh token
+  via `grant_type=authorization_code`, caching both directly on `Checker`
+  (`accessToken`/`expiresAt`/`refreshToken`) - nothing is written to disk;
+  it's memory-only for that process's lifetime. The obtained refresh token
+  is also printed once, so a human watching the console can copy it into
+  `STAMPS_REFRESH_TOKEN` themselves to skip logging in on a future run.
+  `redirectURI` must be pre-registered for `clientID` in the Stamps.com/
+  Endicia developer console (SERA doesn't allow an arbitrary one); a
+  mismatch surfaces as a real SERA error once a code is exchanged, not as
+  something this package can detect up front.
+- Because `authorizeLocked` runs with `c.mu` already held (it's only ever
+  called from inside `token`, which locks first), a second goroutine
+  calling `Ping`/`Scanned` concurrently during a pending login just blocks
+  on the same mutex instead of racing to bind the same local port - that's
+  intentional, not an oversight to fix.
+- `Ping(ctx) error` - the same one-liner in all five: call `token(ctx)`,
   discard the token, return the error. Credential validity just means "can
   this get an OAuth token."
 - `Scanned(ctx, trackingNumber) (bool, error)` - the actual tracking call
   and carrier-specific "has this had a physical scan yet" logic (UPS
   activity `status.type`, FedEx `scanEvents` codes, USPS `statusCategory`,
-  Amazon `eventHistory`/`summary.status`). USPS's also retries on 429 using
-  its own private `retryAfterDelay` (a third copy of the same ~10-line
-  helper also duplicated in `internal/goflow` and, historically, in
-  `cmd/tracker` - see that helper's doc comment for why duplicating it was
-  chosen over a shared dependency).
-- `ups`/`fedex`/`usps` (not `amazon`, which is never the target of the
-  fallback) additionally export `LooksLikeTrackingNumber(trackingNumber
-  string) bool`, backed by a private, deliberately conservative regex - used
-  by `cmd/tracker`'s `detectCarrierFromTrackingNumber` for the
+  Amazon `eventHistory`/`summary.status`, Stamps.com/SERA's single
+  standardized `status_code` enum - `stamps` is the simplest of the five
+  precisely because SERA already normalizes tracking status across
+  carriers, so there's no raw carrier activity list to walk). USPS's also
+  retries on 429 using its own private `retryAfterDelay` (a third copy of
+  the same ~10-line helper also duplicated in `internal/goflow` and,
+  historically, in `cmd/tracker` - see that helper's doc comment for why
+  duplicating it was chosen over a shared dependency).
+- `ups`/`fedex`/`usps` (not `amazon` or `stamps`, neither of which is ever
+  the target of a format-detection fallback) additionally export
+  `LooksLikeTrackingNumber(trackingNumber string) bool`, backed by a
+  private, deliberately conservative regex - used by `cmd/tracker`'s
+  `detectCarrierFromTrackingNumber` for the
   amazon_shipping-is-really-a-relabeled-UPS/FedEx/USPS-shipment fallback.
-- None of the four import `cmd/tracker`, `internal/goflow`, or each other.
+- None of the five import `cmd/tracker`, `internal/goflow`, or each other.
   `cmd/tracker`'s `scanChecker` interface doesn't need any of them to import
   it either - Go interface satisfaction is structural, so a `*ups.Checker`
   (etc.) satisfies it just by having matching `Ping`/`Scanned` methods.
+- `stamps` is architecturally identical to the other four but semantically
+  different: it doesn't correspond to its own Goflow carrier value the way
+  `ups`/`fedex`/`usps`/`amazon_shipping` do. It's an alternative way to
+  check `"usps"` tracking - see `cmd/tracker`'s `checkers` construction
+  below for how the two are chosen between.
 
 ### `cmd/tracker/main.go` (top to bottom)
 
@@ -277,8 +339,18 @@ itself; this is the same order:
    - Parse flags, handle `-h`/`-help`/`help`, create `-dir`.
    - Call `env.Load()`, then `loadConfig()`; build the `checkers` map (only
      for carriers with full credentials - `ups.New(...)`, `fedex.New(...)`,
-     `usps.New(...)`, `amazon.New(...)`), fix `knownCarriers` order (`ups`,
-     `fedex`, `usps`, `amazon_shipping`).
+     `amazon.New(...)`). `checkers["usps"]` is a `switch`, not a plain
+     `if`: `stamps.New(...)` wins if `STAMPS_CLIENT_ID`/`_CLIENT_SECRET` are
+     both set (note: *not* also requiring `STAMPS_REFRESH_TOKEN` - that one
+     is optional, since `stamps.Checker` can obtain it interactively; see
+     its own architecture section above), regardless of whether
+     `USPS_CLIENT_ID`/`_CLIENT_SECRET` are too; `usps.New(...)` is only
+     used as a fallback when Stamps.com isn't configured at all - this
+     precedence was an explicit choice (asked of, and confirmed by, the
+     user when `stamps` was added), not an arbitrary one, so don't flip it
+     without checking. Fix `knownCarriers` order (`ups`, `fedex`, `usps`,
+     `amazon_shipping`) - note there's no separate `"stamps"` entry here;
+     it still reports under the `"usps"` key.
    - Create one `stdin := bufio.NewReader(os.Stdin)` and pass it to every
      interactive prompt for the rest of the run (welcome menu, carrier
      selection, date range) - each prompt creating its own reader from
@@ -413,15 +485,26 @@ itself; this is the same order:
 ## Known limitations (see README's "Notes / caveats" for the full list)
 
 - Only `ups`, `fedex`, `usps`, and `amazon_shipping` have real tracking
-  lookups. Every other Goflow carrier value is left blank.
+  lookups. Every other Goflow carrier value is left blank. (Stamps.com/SERA
+  isn't a separate entry in this list - it's an alternative way to check
+  `usps`, per `STAMPS_*`'s precedence over `USPS_CLIENT_ID`/`_SECRET`.)
 - The Amazon Shipping checker calls SP-API with just an LWA bearer token,
   no AWS SigV4 signing - may need signing added depending on the seller
   application's authorization type.
 - Rate-limit retry (`Retry-After`, 429) is implemented for Goflow
   (`internal/goflow`'s `Client.doRequest`) and USPS specifically (both
-  documented it); UPS/FedEx/Amazon Shipping don't retry on 429 - they rely
-  solely on the per-carrier rate limiter in `carrierRateLimits` to avoid
-  triggering one in the first place.
+  documented it); UPS/FedEx/Amazon Shipping/Stamps.com don't retry on 429 -
+  they rely solely on the per-carrier rate limiter in `carrierRateLimits`
+  to avoid triggering one in the first place (SERA's OpenAPI spec doesn't
+  document a `Retry-After` convention the way Goflow/USPS do, so `stamps`
+  doesn't attempt one - revisit if that turns out to be wrong).
+- `stamps`'s interactive login (see its architecture section above) needs a
+  human at a terminal with a browser and up to 5 minutes free the first
+  time it runs without `STAMPS_REFRESH_TOKEN` set - it will hang for that
+  long, then fail, if run unattended (cron, CI, etc.) without one. For
+  unattended runs, obtain a refresh token interactively once, save it to
+  `STAMPS_REFRESH_TOKEN`, and it won't be needed again until that token is
+  revoked/expires.
 
 ## History
 
